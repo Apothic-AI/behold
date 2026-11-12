@@ -72,21 +72,6 @@ def load(path: str, policy: guard.Policy) -> Snapshot:
     return _parse(raw, path, started, policy)
 
 
-def load_live(policy: guard.Policy, timeout: float = 15.0) -> Snapshot:
-    """Explicit opt-in live read: one read-only herdr call, no daemon, no events."""
-    import json
-
-    started = time.perf_counter()
-    cmd = guard.run(guard.HERDR_SNAPSHOT_ARGV, timeout=timeout, policy=policy)
-    if cmd.returncode != 0:
-        raise SourceError(f"herdr api snapshot failed rc={cmd.returncode}: {cmd.stderr.strip()[:200]}")
-    try:
-        raw = json.loads(cmd.stdout)
-    except ValueError as exc:
-        raise SourceError("herdr api snapshot returned invalid JSON") from exc
-    return _parse(raw, "herdr api snapshot", started, policy)
-
-
 def _parse(raw: Any, source: str, started: float, policy: guard.Policy) -> Snapshot:
     if not isinstance(raw, dict):
         raise SourceError("snapshot is not a JSON object")

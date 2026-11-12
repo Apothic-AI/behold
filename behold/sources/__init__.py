@@ -1,9 +1,9 @@
 """Read-only adapters. Each one returns values plus the exact source it read.
 
-Adapters are pure reads with no ordering dependency, so ``--no-git``, ``--jj``,
-``--lane`` and single-source tests stay trivial. None of them writes, spawns a daemon,
-opens a socket, or reports anything back to herdr/pi: behold must not become a second
-session reporter (the fleet already retired one, ``pi-session-ref-canonical.ts``).
+Adapters are pure reads with no ordering dependency, so fixture and snapshot tests stay
+trivial. None of them writes, spawns a daemon, opens a socket, or reports anything back to
+herdr/pi: behold must not become a second session reporter (the fleet already retired one,
+``pi-session-ref-canonical.ts``).
 """
 
 from __future__ import annotations
