@@ -18,6 +18,38 @@ from . import SUPPORTED_HERDR_PROTOCOLS, SourceError
 AGENT_STATUSES = ("idle", "working", "blocked", "done", "unknown")
 
 
+@dataclass(frozen=True)
+class Observation:
+    """What the roster knows about **when it saw** the topology.
+
+    The topology has no timestamp of its own: a herdr snapshot document says what the
+    panes are, not when they were that way. So the observation is the roster's own
+    record of the moment it looked, and of how much that moment is worth.
+
+    * ``kind`` — where the topology came from: ``live_capture`` (this process asked
+      herdr), ``snapshot_file`` or ``fixture_tree`` (a file was read), or ``unknown``.
+    * ``at_epoch`` / ``at`` — when the roster **observed** the topology. This is what
+      the admission map is stamped with: the map says "this placement was observed
+      then", so it must not claim a moment the roster did not have.
+    * ``source`` — how the moment is known: ``capture_clock`` (the capture's own clock,
+      which cannot be forged) or ``file_mtime`` (a file's mtime, which anyone can set,
+      and which is therefore weak provenance).
+    * ``source_epoch`` — when the **source** was made, when that is knowable: a file's
+      mtime. A live capture has no separate source: the capture *is* the observation,
+      so ``source_epoch`` equals ``at_epoch``.
+
+    A **reused** snapshot keeps this record. A watch iteration that reuses a capture
+    did not see the topology again, and must not pretend it did: re-reading the same
+    capture is not observing it again.
+    """
+
+    kind: str = "unknown"
+    at_epoch: float | None = None
+    at: str | None = None
+    source: str | None = None
+    source_epoch: float | None = None
+
+
 @dataclass
 class Snapshot:
     protocol: int | None
@@ -29,6 +61,12 @@ class Snapshot:
     bytes: int
     duration_ms: float
     extra_keys: list[str] = dc_field(default_factory=list)
+    #: The document as it was read, so a caller can store the topology it came from
+    #: without reading the source a second time.
+    raw: dict[str, Any] | None = None
+    #: When this topology was observed, and how that moment is known. It travels with
+    #: the snapshot: a reused snapshot keeps the observation it was read with.
+    observation: Observation = dc_field(default_factory=Observation)
 
     def workspace(self, workspace_id: str | None) -> dict[str, Any]:
         for ws in self.workspaces:
@@ -72,7 +110,18 @@ def load(path: str, policy: guard.Policy) -> Snapshot:
     return _parse(raw, path, started, policy)
 
 
-def _parse(raw: Any, source: str, started: float, policy: guard.Policy) -> Snapshot:
+def parse_document(raw: Any, source: str, policy: guard.Policy, *,
+                   bytes_: int | None = None) -> Snapshot:
+    """Parse an in-memory snapshot document.
+
+    The live capture path never writes the document to a file first: herdr prints it on
+    stdout and it is parsed here, under the same protocol rules as a file snapshot.
+    """
+    return _parse(raw, source, time.perf_counter(), policy, bytes_=bytes_)
+
+
+def _parse(raw: Any, source: str, started: float, policy: guard.Policy,
+           bytes_: int | None = None) -> Snapshot:
     if not isinstance(raw, dict):
         raise SourceError("snapshot is not a JSON object")
     protocol = raw.get("protocol")
@@ -83,6 +132,8 @@ def _parse(raw: Any, source: str, started: float, policy: guard.Policy) -> Snaps
             f"unsupported herdr protocol {protocol}; supported: {sorted(SUPPORTED_HERDR_PROTOCOLS)}"
         )
     known = {"protocol", "agents", "panes", "workspaces", "tabs", "layouts"}
+    if bytes_ is None:
+        bytes_ = os.path.getsize(source) if os.path.exists(source) else 0
     snap = Snapshot(
         protocol=protocol,
         agents=[a for a in raw.get("agents") or [] if isinstance(a, dict)],
@@ -90,9 +141,10 @@ def _parse(raw: Any, source: str, started: float, policy: guard.Policy) -> Snaps
         workspaces=[w for w in raw.get("workspaces") or [] if isinstance(w, dict)],
         tabs=[t for t in raw.get("tabs") or [] if isinstance(t, dict)],
         source=source,
-        bytes=os.path.getsize(source) if os.path.exists(source) else 0,
+        bytes=bytes_,
         duration_ms=(time.perf_counter() - started) * 1000.0,
         extra_keys=sorted(set(raw.keys()) - known),
+        raw=raw if isinstance(raw, dict) else None,
     )
     policy._record("snapshot", f"protocol={protocol} agents={len(snap.agents)}")
     return snap

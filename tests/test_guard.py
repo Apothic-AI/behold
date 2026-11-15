@@ -73,13 +73,66 @@ class TestReadOnlyBoundary(unittest.TestCase):
 
     def test_no_external_execution_api_exists(self) -> None:
         # V3 removed the adapters *and* the machinery: there is no run(), no argv allowlist,
-        # no child process path to bypass.
+        # no child process path to bypass. V5 adds a one-shot permit for exactly one argv
+        # (``herdr api snapshot``) and nothing else: still no allowlist, still no shell.
         self.assertFalse(guard.EXTERNAL_EXECUTION)
         self.assertFalse(hasattr(guard, "run"))
         self.assertFalse(hasattr(guard, "ALLOWED_ARGVS"))
         self.assertFalse(hasattr(guard, "ALLOWED_BINARIES"))
         with self.assertRaises(guard.NotAllowed):
             guard.refuse_external()
+
+    def test_spawn_permit_is_narrow_and_one_shot(self) -> None:
+        # The argv is the real interpreter: the point of the test is the permit mechanics
+        # (exact argv, one shot), not herdr.
+        argv = (sys.executable, "-c", "pass")
+        with guard.enforce():
+            # A spawn with no permit is refused.
+            with self.assertRaises(guard.ReadOnlyViolation):
+                subprocess.run(list(argv), capture_output=True, check=False)
+            # An unknown purpose is refused before a process can exist.
+            with self.assertRaises(guard.NotAllowed):
+                guard.permit_spawn(argv, purpose="anything-else")
+            permit = guard.permit_spawn(argv, purpose="herdr-snapshot-capture")
+            try:
+                self.assertEqual(len(guard.live_spawn_permits()), 1)
+                # The permit is consumed by the spawn itself: a second one is refused again.
+                subprocess.run(list(argv), capture_output=True, check=False)
+                self.assertEqual(guard.live_spawn_permits(), [])
+                with self.assertRaises(guard.ReadOnlyViolation):
+                    subprocess.run(list(argv), capture_output=True, check=False)
+            finally:
+                permit.revoke()
+
+    def test_spawn_permit_does_not_match_another_argv(self) -> None:
+        argv = (sys.executable, "-c", "pass")
+        with guard.enforce():
+            permit = guard.permit_spawn(argv, purpose="herdr-snapshot-capture")
+            try:
+                with self.assertRaises(guard.ReadOnlyViolation):
+                    subprocess.run(list(argv) + ["--extra"], capture_output=True, check=False)
+            finally:
+                # the refused spawn did not consume the permit: drop it explicitly
+                permit.revoke()
+        self.assertEqual(guard.live_spawn_permits(), [])
+
+    def test_cache_write_scope_allows_only_the_cache_path(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "cache", "behold.db")
+            allowed = os.path.join(tmp, "cache")
+            with guard.enforce():
+                with guard.cache_write_scope([db], dirs=[allowed]):
+                    os.makedirs(allowed, exist_ok=True)
+                    with open(db, "w", encoding="utf-8") as fh:
+                        fh.write("x")
+                    # anything outside the scope is still refused
+                    with self.assertRaises(guard.ReadOnlyViolation):
+                        open(os.path.join(tmp, "other.txt"), "w")
+            # and the scope ends with the block
+            with guard.enforce():
+                with self.assertRaises(guard.ReadOnlyViolation):
+                    open(db, "w")
 
     def test_any_spawn_is_refused_under_the_guard(self) -> None:
         with guard.enforce():
@@ -195,7 +248,6 @@ class TestDenyBeforeRead(unittest.TestCase):
 class TestNoServiceOrReporter(unittest.TestCase):
     def test_no_daemon_db_or_reporter_in_source(self) -> None:
         forbidden = {
-            "sqlite3": "database",
             "report_agent": "duplicate reporter",
             "report_metadata": "duplicate metadata writer",
             "Thread(": "background thread",
@@ -219,6 +271,47 @@ class TestNoServiceOrReporter(unittest.TestCase):
         # not call; those are the boundary itself, and they are asserted separately above.
         offenders = [o for o in offenders if not o.startswith("behold/guard.py")]
         self.assertEqual(offenders, [])
+
+    def test_only_the_cache_module_may_use_sqlite(self) -> None:
+        # V5 approved exactly one database: behold's own cache. It is a cache of derived,
+        # sanitized state — not a fleet store, not a session file, not a second reporter.
+        users = []
+        for base, _dirs, files in os.walk(os.path.join(ROOT, "behold")):
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(base, name)
+                with open(path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+                if "import sqlite3" in text:
+                    users.append(os.path.relpath(path, ROOT))
+        self.assertEqual(users, ["behold/cache.py"])
+
+    def test_the_cache_module_never_opens_a_session_file(self) -> None:
+        # The cache writes its own file and reads its own spool. It must not touch a pi
+        # session file: a session is the fleet's, not behold's.
+        path = os.path.join(ROOT, "behold", "cache.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertNotIn(".jsonl", text)
+        # the only file it opens for reading is the spool record
+        self.assertIn('open(path, "r", encoding="utf-8")', text)
+        self.assertNotIn('open(path, "a"', text)
+        # and the cache module itself writes no file at all: the admission map it
+        # publishes for the reporter is written by the admission module, which is the
+        # only other place in behold that writes.
+        writes = [line for line in text.splitlines()
+                  if 'open(path, "w"' in line or 'open(path, "wb"' in line]
+        self.assertEqual(writes, [], writes)
+        admission = os.path.join(ROOT, "behold", "admission.py")
+        with open(admission, "r", encoding="utf-8") as fh:
+            admission_text = fh.read()
+        admission_writes = [line for line in admission_text.splitlines()
+                            if 'open(temp, "w"' in line]
+        self.assertEqual(len(admission_writes), 1, admission_writes)
+        # and it publishes atomically: a temp file and a rename
+        self.assertIn("os.replace(temp, path)", admission_text)
+        self.assertNotIn(".jsonl", admission_text)
 
     def test_guard_refuses_the_reporter_methods_by_construction(self) -> None:
         # There is no herdr socket client to call them with: the only herdr interaction is
@@ -249,7 +342,7 @@ class TestRosterIsReadOnly(unittest.TestCase):
         before = manifest()
         proc = subprocess.run(
             [sys.executable, os.path.join(ROOT, "bin", "behold"), "roster", "--root", FIXTURE_ROOT,
-             "--as-of", "2026-11-11T03:00:00Z"],
+             "--as-of", "2026-11-11T03:00:00Z", "--cache", "off"],
             capture_output=True, text=True, timeout=180, env={**os.environ, "PYTHONPATH": ROOT},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[:2000])
@@ -272,7 +365,8 @@ class TestRosterIsReadOnly(unittest.TestCase):
         self.assertNotIn("--output", options)
         code = subprocess.run(
             [sys.executable, os.path.join(ROOT, "bin", "behold"), "roster", "--root", FIXTURE_ROOT,
-             "--as-of", "2026-11-11T03:00:00Z", "--output", "/tmp/should-not-exist.json"],
+             "--as-of", "2026-11-11T03:00:00Z", "--cache", "off",
+             "--output", "/tmp/should-not-exist.json"],
             capture_output=True, text=True, timeout=180, env={**os.environ, "PYTHONPATH": ROOT},
         )
         self.assertEqual(code.returncode, 2, code.stderr[:400])

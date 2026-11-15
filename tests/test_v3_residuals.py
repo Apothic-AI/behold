@@ -182,10 +182,21 @@ class TestR3ExternalBoundary(unittest.TestCase):
         for attr in ("git_status", "git_identity", "stash_count", "jj_query", "_jj"):
             self.assertFalse(hasattr(repo, attr), attr)
 
-    def test_herdr_live_read_is_refused_with_a_reason(self):
-        code, _out, err = roster("--herdr")
-        self.assertEqual(code, 3, err[:300])
-        self.assertIn("no external execution", err)
+    def test_herdr_capture_replaces_the_refusal(self):
+        # V5: the refusal is gone and the capture is the path. The capture is exercised with
+        # a FAKE herdr on PATH: this suite never touches the live herdr.
+        from tests.helpers import fake_herdr_bin, flat_snapshot
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = fake_herdr_bin(tmp, document=flat_snapshot())
+            env = {**os.environ, "PATH": bindir + os.pathsep + os.environ.get("PATH", "")}
+            proc = subprocess.run(
+                [sys.executable, os.path.join(ROOT, "bin", "behold"), "roster",
+                 "--root", FIXTURE_ROOT, "--as-of", AS_OF, "--herdr", "--cache", "off"],
+                capture_output=True, text=True, timeout=180, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr[:2000])
+        doc = json.loads(proc.stdout)
+        self.assertEqual(doc["behold"]["snapshot"]["source"], "herdr api snapshot (captured)")
+        self.assertEqual(doc["behold"]["guard"]["spawns"], {"herdr-snapshot-capture": 1})
 
     def test_repo_fields_carry_the_stable_reason(self):
         require_fixtures()
@@ -272,12 +283,12 @@ class TestHonesty(unittest.TestCase):
 
     def test_field_id_count_is_unique_and_matches_the_ledger(self):
         per_lane = {k for lane in self.doc["lanes"] for k in lane["fields"]}
-        self.assertEqual(len(per_lane), 56, sorted(per_lane))
+        self.assertEqual(len(per_lane), 58, sorted(per_lane))
         ledger = os.path.join(ROOT, "FIELD-LEDGER.md")
         with open(ledger, encoding="utf-8") as fh:
             text = fh.read()
-        self.assertIn("57 unique field ids", text)
-        self.assertIn("56 per-lane", text)
+        self.assertIn("59 unique field ids", text)
+        self.assertIn("58 per-lane", text)
 
     def test_e1_does_not_promise_exact_extension_inventory(self):
         lane = lanes(self.doc)["w1A:p1"]

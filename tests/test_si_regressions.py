@@ -11,21 +11,29 @@ These are deliberately adversarial and small, and each one names the defect it p
 7. beads session metadata matched by suffix
 8. a watched document whose ages never advance and whose caches never re-read
 9. fixtures that need a host `jj` binary
+10. a watch that re-stamps the admission map on every iteration, so an old topology
+    looks fresh forever and the map's 300-second bound never applies
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from tests.helpers import AS_OF, FIXTURE_ROOT, ROOT, field, lanes, require_fixtures, roster, roster_json
+from tests.helpers import (AS_OF, FIXTURE_ROOT, ROOT, fake_herdr_bin, fake_herdr_calls, field,
+                           lanes, nested_snapshot, require_fixtures, roster, roster_json)
 
 sys.path.insert(0, ROOT)
 
+from behold import admission as admission_mod  # noqa: E402
+from behold import cache as cache_mod  # noqa: E402
 from behold import cli, guard, identity, session, watch  # noqa: E402
 from behold.sources import Paths, fleet_state, pi_state  # noqa: E402
 
@@ -322,6 +330,155 @@ class TestWatchMaterializes(unittest.TestCase):
             self.assertIn("bd-planted", [i["id"] for i in field(second, "B-1")["value"]["issues"]])
 
 
+class _SteppingClock:
+    """A synthetic wall clock. Every reading moves it one step forward.
+
+    The map's freshness and the topology's age are claims about time, so a test that
+    pins them has to be able to move time. The step is small enough that the ages stay
+    sane and large enough that "the moment this was observed" and "the moment it was
+    published again" are never the same instant.
+    """
+
+    def __init__(self, start: float, step: float = 1.0):
+        self.now = start
+        self.step = step
+        self.readings = 0
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step
+        self.readings += 1
+        return value
+
+
+def _documents(text: str) -> list[dict]:
+    """The documents a watch emitted, whatever shape the renderer wrote them in."""
+    decoder = json.JSONDecoder()
+    out: list[dict] = []
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        document, index = decoder.raw_decode(text, index)
+        out.append(document)
+    return out
+
+
+class TestWatchDoesNotRefreshTheAdmissionMap(unittest.TestCase):
+    """The watch must not make an old topology look fresh.
+
+    The finding: the watch built a fresh ``Runner`` per iteration over the run's
+    snapshot, and that runner stamped the admission map with the **current** time. Every
+    iteration therefore published a map that looked brand new, so a reporter could keep
+    using a topology that was hours old and the map's own 300-second bound never
+    applied. The reused snapshot must keep the moment it was observed, and the
+    topology's provenance must stay honest about how old it is.
+    """
+
+    def setUp(self):
+        require_fixtures()
+
+    def _plant_change(self) -> None:
+        """Touch a lane's session file, so the watch has something to re-derive."""
+        target = os.path.join(FIXTURE_ROOT, "instances", "launch-A", "sessions")
+        for base, _dirs, files in os.walk(target):
+            for name in files:
+                if name.endswith(".jsonl") and "000000000001" in name:
+                    with open(os.path.join(base, name), "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({
+                            "type": "message", "id": "zz2", "parentId": "e0004",
+                            "timestamp": "2026-11-11T02:59:30Z",
+                            "message": {"role": "assistant", "content": [],
+                                        "provider": "acme", "model": "acme-large-1",
+                                        "usage": {"input": 1, "output": 1, "cacheRead": 0,
+                                                  "cacheWrite": 0, "totalTokens": 2},
+                                        "stopReason": "stop", "timestamp": 1793000100000,
+                                        "durationMs": 10}}) + "\n")
+                    return
+
+    def test_the_map_keeps_the_moment_the_topology_was_observed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot_path = os.path.join(FIXTURE_ROOT, "herdr", "snapshot.json")
+            clock = _SteppingClock(os.path.getmtime(snapshot_path))
+            db_path = os.path.join(tmp, "behold.db")
+            args = cli.build_parser().parse_args(
+                ["roster", "--root", FIXTURE_ROOT, "--cache", "on", "--cache-db", db_path])
+            policy = guard.Policy()
+            runner = cli.Runner(args, policy, clock=clock)
+            runner.publish_admission()
+            observed_epoch = runner.snapshot.observation.at_epoch
+            try:
+                deriver = cli.WatchDeriver(args, policy, runner, clock=clock)
+                documents: list[dict] = []
+
+                def emit(doc, step):
+                    documents.append(doc)
+                    self._plant_change()
+
+                watch.run_watch(derive=deriver, emit=emit,
+                                config=watch.WatchConfig(iterations=2, interval_s=0.05,
+                                                         max_seconds=5.0))
+            finally:
+                runner.close()
+            self.assertEqual(len(documents), 2, documents)
+            # The published map carries the moment the topology was **observed**, not
+            # the moment the watch published it again.
+            with open(cache_mod.deny_file_path(db_path), encoding="utf-8") as fh:
+                published = json.load(fh)
+            self.assertEqual(published["captured_at_epoch"], observed_epoch)
+            # It is fresh when it is written...
+            cache_mod.read_deny_file(cache_mod.deny_file_path(db_path), now=observed_epoch)
+            # ...and it ages from that moment, so the bound applies.
+            with self.assertRaises(admission_mod.AdmissionError) as ctx:
+                cache_mod.read_deny_file(
+                    cache_mod.deny_file_path(db_path),
+                    now=observed_epoch + admission_mod.ADMISSION_TTL_S + 1)
+            self.assertIn("stale", str(ctx.exception))
+            # The topology's provenance stays honest: the same source, and an age that
+            # grows, because the watch did not look at the topology again.
+            for document in documents:
+                topology = document["behold"]["topology"]
+                self.assertEqual(topology["kind"], "fixture_tree")
+                self.assertEqual(topology["captured_at_source"], "file_mtime")
+            self.assertGreater(documents[1]["behold"]["topology"]["age_s"],
+                               documents[0]["behold"]["topology"]["age_s"])
+
+    def test_the_watch_reports_the_capture_it_reused(self):
+        # A reused **capture** keeps its provenance: the fresh runner of a watch
+        # iteration has no capture receipt of its own, and used to report the topology
+        # as "unknown" (or as a file) instead of the capture it was built from.
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = fake_herdr_bin(tmp, document=nested_snapshot())
+            db_path = os.path.join(tmp, "behold.db")
+            argv = ["roster", "--root", FIXTURE_ROOT, "--herdr", "--cache", "on",
+                    "--cache-db", db_path, "--watch", "--watch-iterations", "1",
+                    "--watch-max-seconds", "0.2"]
+            buffer = io.StringIO()
+            with mock.patch.dict(
+                    os.environ,
+                    {"PATH": bindir + os.pathsep + os.environ.get("PATH", "")}):
+                with contextlib.redirect_stdout(buffer):
+                    code = cli.main(argv)
+            self.assertEqual(code, 0, buffer.getvalue()[:2000])
+            documents = _documents(buffer.getvalue())
+            self.assertTrue(documents, buffer.getvalue()[:2000])
+            document = documents[0]
+            capture = document["behold"]["capture"]
+            self.assertTrue(capture["ok"])
+            topology = document["behold"]["topology"]
+            self.assertEqual(topology["kind"], "live_capture")
+            self.assertEqual(topology["captured_at_source"], "capture_clock")
+            self.assertEqual(topology["captured_at"], capture["captured_at"])
+            # and the map is stamped with the capture, not with the publication
+            with open(cache_mod.deny_file_path(db_path), encoding="utf-8") as fh:
+                published = json.load(fh)
+            self.assertEqual(published["captured_at_epoch"], capture["captured_at_epoch"])
+            # herdr was asked once: the topology was captured once and reused
+            self.assertEqual(fake_herdr_calls(bindir), ["api", "snapshot"])
+
+
 class TestHermeticFixtures(unittest.TestCase):
     def test_jj_absent_and_present_both_work(self):
         # V4 removed the jj adapter and the --jj flag, so the roster is identical with a jj
@@ -332,7 +489,8 @@ class TestHermeticFixtures(unittest.TestCase):
             env = {**os.environ, "PATH": path, "PYTHONPATH": ROOT}
             proc = subprocess.run(
                 [sys.executable, os.path.join(ROOT, "bin", "behold"), "roster",
-                 "--root", FIXTURE_ROOT, "--as-of", AS_OF, "--lane", "w1G:p1"],
+                 "--root", FIXTURE_ROOT, "--as-of", AS_OF, "--lane", "w1G:p1",
+                 "--cache", "off"],
                 capture_output=True, text=True, timeout=120, env=env)
             self.assertEqual(proc.returncode, 0, proc.stderr[:600])
             return json.loads(proc.stdout)["lanes"][0]

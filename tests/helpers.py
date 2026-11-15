@@ -10,8 +10,16 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from typing import Any
+
+from tests import isolation
+
+#: The fail-closed guard is installed as soon as the helpers are imported, so it is in
+#: place before any test runs -- and before any test can open the real machine's stores.
+isolation.install()
+isolation.prepare_sandbox()
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 FIXTURE_ROOT = os.environ.get("BEHOLD_FIXTURE_ROOT", "/tmp/behold-fix")
@@ -43,12 +51,24 @@ GIT: tuple[str, ...] = ()
 
 
 def roster(*extra: str, root: str | None = None) -> tuple[int, str, str]:
-    """Run the CLI in a subprocess (so the guard/audit hook is a fresh process)."""
+    """Run the CLI in a subprocess (so the guard/audit hook is a fresh process).
+
+    The run is synthetic and explicit by construction: a fixture tree, a fixed clock, and
+    an explicit cache decision with a cache path inside the sandbox. The child inherits
+    the redirected environment, so its own ``sitecustomize`` refuses the real machine too.
+    """
     argv = [sys.executable, os.path.join(ROOT, "bin", "behold"), "roster",
-            "--root", root or FIXTURE_ROOT, "--as-of", AS_OF, *extra]
+            "--root", root or FIXTURE_ROOT, "--as-of", AS_OF,
+            "--cache", "off", "--cache-db", scratch_cache_db(), *extra]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=180,
-                          env={**os.environ, "PYTHONPATH": ROOT})
+                          env=isolation.redirect_environment())
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def scratch_cache_db() -> str:
+    """A cache path inside the sandbox, unique per call."""
+    directory = tempfile.mkdtemp(prefix="cache-", dir=isolation.SANDBOX)
+    return os.path.join(directory, "behold.db")
 
 
 def roster_json(*extra: str, root: str | None = None) -> dict[str, Any]:
@@ -85,3 +105,65 @@ def require_fixtures() -> None:
             f"fixtures missing at {FIXTURE_ROOT}; run tests/run-tests.sh or "
             f"python3 fixtures/make_fixtures.py {FIXTURE_ROOT}"
         )
+
+
+def flat_snapshot(protocol: int = 22) -> dict[str, Any]:
+    """A minimal herdr snapshot document in the flat shape the roster reads."""
+    return {
+        "protocol": protocol,
+        "workspaces": [],
+        "tabs": [],
+        "panes": [],
+        "agents": [],
+    }
+
+
+def nested_snapshot(protocol: int = 22) -> dict[str, Any]:
+    """A herdr snapshot document in the live API's nested shape."""
+    return {
+        "protocol": protocol,
+        "workspaces": [
+            {
+                "workspace_id": "wX",
+                "label": "fake-workspace",
+                "number": 1,
+                "tab_count": 1,
+                "pane_count": 1,
+                "agent_status": "idle",
+                "tabs": [
+                    {
+                        "tab_id": "wX:t1",
+                        "label": "fake-lane",
+                        "panes": [
+                            {
+                                "pane_id": "wX:p1",
+                                "label": "fake-lane",
+                                "agent_status": "idle",
+                                "cwd": "/tmp",
+                                "agent": {"name": "pi", "cwd": "/tmp"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def fake_herdr_bin(directory: str | None = None, *,
+                   document: dict[str, Any] | None = None,
+                   exit_code: int = 0, stderr: str = "") -> str:
+    """Create a fake ``herdr`` executable and return the directory holding it.
+
+    The fake prints a snapshot document on stdout, exactly as ``herdr api snapshot``
+    does, and records how it was called in ``herdr.called``. It lives **inside the
+    sandbox**, so the isolation guard allows the spawn and the real binary is never a
+    candidate: the suite can exercise the capture path end to end without ever touching
+    the live herdr.
+    """
+    return isolation.fake_herdr_bin(document=document, exit_code=exit_code, stderr=stderr)
+
+
+def fake_herdr_calls(directory: str) -> list[str] | None:
+    """The argv the fake herdr was called with, or ``None`` when it was never called."""
+    return isolation.fake_herdr_calls(directory)

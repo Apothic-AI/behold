@@ -151,6 +151,16 @@ def last_observed(key: str, value: Any, reason: str, **kw: Any) -> Field:
     return Field(key=key, state=STALE, value=value, reason=reason, **kw)
 
 
+def observed(key: str, value: Any, **kw: Any) -> Field:
+    """A fresh but last-observed value.
+
+    The observation is recent, so the state is ``present``; it is still a *last
+    observation* rather than a read of the authoritative store, so the class says so.
+    """
+    kw.setdefault("klass", LAST_OBSERVED)
+    return Field(key=key, state=PRESENT, value=value, **kw)
+
+
 def rollup(key: str, fields: Iterable[Field], *, privacy: int = 0) -> dict[str, Any]:
     """A non-Field structural node: counts of child states, no values of its own."""
     states: dict[str, int] = {}
